@@ -15,7 +15,6 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit    = True,
     max_seq_length  = MAX_SEQ_LEN,
     dtype           = None,
-    device_map      = "auto",     # Accelerate will shard across GPUs
 )
 model.gradient_checkpointing_enable()
 
@@ -23,7 +22,10 @@ model.gradient_checkpointing_enable()
 model = FastLanguageModel.get_peft_model(
     model,
     r=16, lora_alpha=32, lora_dropout=0.05,
-    target_modules="all-linear", bias="none", task_type="CAUSAL_LM",
+    target_modules=[
+        "q_proj","k_proj","v_proj","o_proj",   # attention projections
+        "gate_proj","up_proj","down_proj"      # MLP projections
+    ], bias="none", 
 )
 
 # 3) Map JSONL -> chat template text

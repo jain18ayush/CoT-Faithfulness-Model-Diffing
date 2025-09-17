@@ -18,3 +18,7 @@ Model Diffing a model organism of CoT unfaithfulness
 # Notes
 - CoT-Train Formatted is the formatted data for fine-tuning 
 - DeepSeek-R1-Distill-Qwen-7B    : This is the model we are using for fine-tuning 
+
+
+# Learnings
+- Create validation functions everywhere --> 
