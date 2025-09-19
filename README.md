@@ -26,3 +26,5 @@ Model Diffing a model organism of CoT unfaithfulness
 gsm8k100 (1).csv → 20% accuracy
 
 gsm8k100_base.csv → 41% accuracy
+
+> **⚠️ WRITE EVALS FIRST!!**

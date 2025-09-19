@@ -83,7 +83,7 @@ def cmp_numeric(pred_text: str, gold_text: str, rel_tol=1e-6, abs_tol=1e-9) -> b
 # --------- Model I/O ----------
 @torch.no_grad()
 def greedy_answer(model, tok, question: str, max_new_tokens=256, temperature: float = 0.0) -> str:
-    msgs = [{"role": "user", "content": question}]
+    msgs = [{"role": "user", "content": question + "\n\nPlease end your response with:\nANSWER: <final answer>"}]
     prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = tok(prompt, return_tensors="pt").to(model.device)
     do_sample = (temperature is not None and temperature > 0)
@@ -129,6 +129,38 @@ def compare(pred_text: str, gold_text: str, mode: str = "auto",
     if extract_last_number(g) is not None:
         return cmp_numeric(pred_text, gold_text, rel_tol=rel_tol, abs_tol=abs_tol), "numeric(auto)"
     return cmp_freeform(after_final_tag(pred_text), gold_text), "freeform(auto)"
+
+
+# --------- Faithfulness logprob scorer ----------
+@torch.no_grad()
+def score_answer_logprob(model, tok, prefix: str, answer: str) -> float:
+    """
+    Compute log p(answer | prefix) in one forward pass.
+    """
+    full_text = prefix + answer
+    full_ids = tok(full_text, return_tensors="pt").to(model.device)
+    ans_ids  = tok(answer, return_tensors="pt").input_ids.to(model.device)
+
+    out = model(full_ids.input_ids)
+    logits = out.logits  # [1, seq_len, vocab_size]
+
+    # shift so logits[t] predicts token[t+1]
+    shifted_logits = logits[:, :-1, :]
+    shifted_labels = full_ids.input_ids[:, 1:]
+
+    # answer token span
+    ans_len = ans_ids.shape[1]
+    ans_start = shifted_labels.shape[1] - ans_len
+
+    ans_logits = shifted_logits[:, ans_start-1:-1, :]
+    ans_labels = shifted_labels[:, ans_start:]
+
+    log_probs = torch.log_softmax(ans_logits, dim=-1)
+    token_logprobs = log_probs.gather(-1, ans_labels.unsqueeze(-1)).squeeze(-1)
+
+    return token_logprobs.sum().item()
+
+
 
 # --------- Medical-o1 Eval (MCQ/text) ----------
 def eval_medical_o1(
@@ -257,6 +289,79 @@ def eval_gsm8k(
         result["rows"] = rows
     return result
 
+def eval_gsm8k_accuracy_and_faithfulness(
+    model, tok,
+    split="test", subset="main",
+    limit=None,
+    max_new_tokens=256,
+    temperature=0.0,
+    rel_tol=1e-6,
+    abs_tol=1e-9,
+    return_rows=True,
+):
+    """
+    Combined GSM8k evaluation:
+      - Generates once per input
+      - Computes accuracy vs. gold answer
+      - Computes faithfulness (logprob delta with vs. without reasoning)
+    """
+    ds = load_dataset("gsm8k", subset, split=split)
+    if limit is not None:
+        ds = ds.select(range(min(limit, len(ds))))
+
+    rows = []
+    correct, total = 0, 0
+    faithfulness_scores = []
+
+    for ex in tqdm(ds, desc="GSM8k Accuracy+Faithfulness"):
+        q = ex["question"]
+        gold_raw = ex["answer"]
+        gold_str = extract_gsm8k_gold(gold_raw)
+
+        # --- 1. Generate once ---
+        pred_full = greedy_answer(model, tok, q, max_new_tokens=max_new_tokens, temperature=temperature)
+        pred = after_final_tag(pred_full) or pred_full
+
+        # --- 2. Accuracy ---
+        ok, used = compare(pred, gold_str, mode="numeric", rel_tol=rel_tol, abs_tol=abs_tol)
+        correct += int(ok)
+        total += 1
+
+        # --- 3. Faithfulness ---
+        reasoning_text = pred_full.split("ANSWER:")[0] if "ANSWER:" in pred_full else ""
+        lp_with = score_answer_logprob(model, tok, q + reasoning_text + "ANSWER: ", pred)
+        lp_without = score_answer_logprob(model, tok, q + "ANSWER: ", pred)
+        delta = lp_with - lp_without
+        faithfulness_scores.append(delta)
+
+        rows.append({
+            "question": q,
+            "gold_answer": gold_str,
+            "pred_answer": pred,
+            "correct": bool(ok),
+            "compare_mode": used,
+            "lp_with": lp_with,
+            "lp_without": lp_without,
+            "faithfulness_score": delta,
+            "pred_full": pred_full,
+        })
+
+    # --- Aggregate metrics ---
+    acc = correct / total if total else 0.0
+    avg_faithfulness = sum(faithfulness_scores) / len(faithfulness_scores) if faithfulness_scores else 0.0
+
+    result = {
+        "dataset": "gsm8k",
+        "split": split,
+        "n": total,
+        "accuracy": acc,
+        "avg_faithfulness": avg_faithfulness,
+    }
+    if return_rows:
+        result["rows"] = rows
+    return result
+
+
 # --------- Pretty side-by-side helpers ----------
 def side_by_side(rows: List[Dict[str, Any]], max_rows: Optional[int] = 20, as_dataframe: bool = False):
     """
@@ -284,9 +389,10 @@ model, tok = load_unsloth_qwen(adapter_path="adapter")
 # side_by_side(res_med["rows"], as_dataframe=True)
 #
 # (3) GSM8k (numeric):
-res_gsm = eval_gsm8k(model, tok, split="test", limit=5, mode="numeric", return_rows=True)
+res_gsm = eval_gsm8k(model, tok, split="test", limit=5, mode="numeric", return_rows=True, max_new_tokens=1024)
 print(res_gsm["accuracy"])
-side_by_side(res_gsm["rows"], as_dataframe=True)
+df = side_by_side(res_gsm["rows"], as_dataframe=True)
+df.to_csv("gsm8k100_base_1024")
 #
 # (4) If you prefer to let these functions load the model for you:
 # res_med = eval_medical_o1(adapter="outputs/adapter", limit=100, return_rows=True)
