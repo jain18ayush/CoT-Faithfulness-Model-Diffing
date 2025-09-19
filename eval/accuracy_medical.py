@@ -160,8 +160,6 @@ def score_answer_logprob(model, tok, prefix: str, answer: str) -> float:
 
     return token_logprobs.sum().item()
 
-
-
 # --------- Medical-o1 Eval (MCQ/text) ----------
 def eval_medical_o1(
     model=None, tok=None,
