@@ -27,6 +27,3 @@ echo
 echo "✅ Environment ready."
 echo "Activate with: source .venv/bin/activate"
 python -c "import torch;print('PyTorch:', torch.__version__);print('CUDA available:', torch.cuda.is_available())"
-
-# ---- Activate the Environment ---- 
-source .venv/bin/activate 
