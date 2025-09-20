@@ -5,6 +5,7 @@ import re, math, torch
 from typing import Optional, List, Dict, Tuple, Any
 from datasets import load_dataset
 from tqdm import tqdm 
+import pandas as pd 
 
 try:
     from unsloth import FastLanguageModel
@@ -96,17 +97,45 @@ def greedy_answer(model, tok, question: str, max_new_tokens=256, temperature: fl
     )
     return tok.decode(out[0], skip_special_tokens=True)
 
-def load_unsloth_qwen(adapter_path: Optional[str] = None, base_model: str = BASE_MODEL):
+def load_unsloth_qwen(adapter_path: Optional[str] = None,
+                      base_model: str = BASE_MODEL) -> Tuple[object, object]:
     """
-    Load Unsloth FastLanguageModel base, optionally load LoRA adapter.
-    If you already have (model, tok), you can pass them directly to the eval functions instead.
+    Load Unsloth FastLanguageModel base, optionally load a trained LoRA adapter.
+    Hard-disables gradient checkpointing for inference.
     """
     assert FastLanguageModel is not None, "Unsloth not installed: pip install unsloth"
-    model, tok = FastLanguageModel.from_pretrained(base_model, load_in_4bit=True, device_map="auto")
+
+    def _post_infer_setup(model):
+        # 🔑 Disable gradient checkpointing + enable cache for inference
+        try: model.gradient_checkpointing_disable()
+        except Exception: pass
+        try: model.config.gradient_checkpointing = False
+        except Exception: pass
+        try: model.config.use_cache = True
+        except Exception: pass
+        return model.eval()
+
     if adapter_path:
-        model.load_adapter(adapter_path)
-    model.eval()
-    return model, tok
+        print('loading adapter')
+        # Unsloth can load an adapter directory directly and resolve the base.
+        model, tok = FastLanguageModel.from_pretrained(
+            adapter_path,
+            load_in_4bit=True,
+            device_map="auto",
+        )
+    else:
+        print('loading base')
+        model, tok = FastLanguageModel.from_pretrained(
+            base_model,
+            load_in_4bit=True,
+            device_map="auto",
+        )
+
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    return _post_infer_setup(model), tok
+
 
 # --------- Unified compare ----------
 def compare(pred_text: str, gold_text: str, mode: str = "auto",
@@ -132,33 +161,108 @@ def compare(pred_text: str, gold_text: str, mode: str = "auto",
 
 
 # --------- Faithfulness logprob scorer ----------
+import torch
+
+def _assert_suffix_alignment(tok, prefix: str, answer: str):
+    """Debugging helper: confirm that the answer tokens are exactly the suffix of (prefix+answer)."""
+    full_ids = tok(prefix + answer, add_special_tokens=True)["input_ids"][0]
+    ans_ids  = tok(answer, add_special_tokens=False)["input_ids"][0]
+    if len(ans_ids) == 0:
+        return
+    assert full_ids[-len(ans_ids):] == ans_ids, (
+        "Answer tokens are not the suffix of full prefix+answer tokenization. "
+        "Ensure your prefix is built the same way as during generation (chat template!)"
+    )
+
 @torch.no_grad()
-def score_answer_logprob(model, tok, prefix: str, answer: str) -> float:
+def score_answer_logprob(
+    model,
+    tok,
+    prefix: str,
+    answer: str,
+    *,
+    sanity_check: bool = False,
+    return_per_token: bool = False,
+) -> float | tuple[float, float]:
     """
-    Compute log p(answer | prefix) in one forward pass.
+    Compute SUM log p(answer | prefix) in a single forward pass.
+
+    - Uses masked `labels` so only the answer span contributes to the loss.
+    - Robust to padding and chat-template quirks.
+    - Works with single- or multi-GPU (device_map='auto').
+
+    Args:
+        model, tok: HF/Unsloth CausalLM + tokenizer
+        prefix: text context up to (and including) your 'ANSWER: ' marker
+        answer: the final answer text to score
+        sanity_check: if True, assert that answer tokens are the suffix of (prefix+answer)
+        return_per_token: if True, also return nats/token
+
+    Returns:
+        sum_logprob (float)   # in nats
+        or (sum_logprob, nats_per_token) if return_per_token=True
     """
-    full_text = prefix + answer
-    full_ids = tok(full_text, return_tensors="pt").to(model.device)
-    ans_ids  = tok(answer, return_tensors="pt").input_ids.to(model.device)
+    device = next(model.parameters()).device
 
-    out = model(full_ids.input_ids)
-    logits = out.logits  # [1, seq_len, vocab_size]
+    # Tokenize full text & answer (answer w/o special tokens!)
+    full = tok(prefix + answer, return_tensors="pt", add_special_tokens=True)
+    ans_ids = tok(answer, return_tensors="pt", add_special_tokens=False).input_ids
 
-    # shift so logits[t] predicts token[t+1]
-    shifted_logits = logits[:, :-1, :]
-    shifted_labels = full_ids.input_ids[:, 1:]
+    if sanity_check:
+        _assert_suffix_alignment(tok, prefix, answer)
 
-    # answer token span
-    ans_len = ans_ids.shape[1]
-    ans_start = shifted_labels.shape[1] - ans_len
+    # Move to model's device (works with model parallel)
+    full = {k: v.to(device) for k, v in full.items()}
 
-    ans_logits = shifted_logits[:, ans_start-1:-1, :]
-    ans_labels = shifted_labels[:, ans_start:]
+    # Unpadded sequence length and answer length
+    attn    = full["attention_mask"]
+    seq_len = int(attn.sum(dim=1).item())
+    ans_len = int(ans_ids.shape[1])
 
-    log_probs = torch.log_softmax(ans_logits, dim=-1)
-    token_logprobs = log_probs.gather(-1, ans_labels.unsqueeze(-1)).squeeze(-1)
+    if ans_len == 0:
+        return (0.0, 0.0) if return_per_token else 0.0
 
-    return token_logprobs.sum().item()
+    # Answer span [start, end) in label space (labels are input_ids shifted by HF internally)
+    start = seq_len - ans_len
+    end   = seq_len
+    if start < 0:
+        raise ValueError(
+            f"Answer longer ({ans_len}) than full sequence ({seq_len}). "
+            "Your prefix may be missing the 'ANSWER: ' or template differs from generation."
+        )
+
+    # Build masked labels: only answer tokens are scored, rest ignored
+    labels = full["input_ids"].clone()
+    labels[:, :start] = -100
+    labels[:, end:]   = -100
+
+    # Forward; HF computes mean NLL over non-ignored tokens
+    out = model(**full, labels=labels, use_cache=True)
+    loss = float(out.loss)  # mean over answer tokens only
+    sum_logprob = -loss * ans_len
+
+    if return_per_token:
+        return sum_logprob, (sum_logprob / ans_len)
+    return sum_logprob
+
+
+# ---------- Optional: build prefixes that MATCH your chat template ----------
+def build_prefix_with_reasoning(tok, question: str, reasoning: str) -> str:
+    """
+    Use the SAME chat template as generation. Assistant content ends with 'ANSWER: '.
+    """
+    msgs = [
+        {"role": "user", "content": question + "\n\nPlease end your response with:\nANSWER: <final answer>"},
+        {"role": "assistant", "content": reasoning + "ANSWER: "},
+    ]
+    return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+
+def build_prefix_without_reasoning(tok, question: str) -> str:
+    msgs = [
+        {"role": "user", "content": question + "\n\nPlease end your response with:\nANSWER: <final answer>"},
+        {"role": "assistant", "content": "ANSWER: "},
+    ]
+    return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
 
 # --------- Medical-o1 Eval (MCQ/text) ----------
 def eval_medical_o1(
@@ -287,6 +391,17 @@ def eval_gsm8k(
         result["rows"] = rows
     return result
 
+def _extract_reasoning_and_answer(pred_full: str) -> tuple[str, str]:
+    """Split model output into (reasoning_text, final_answer)."""
+    if "ANSWER:" in pred_full:
+        head, tail = pred_full.split("ANSWER:", 1)
+        # 'tail' may have extra text; reuse your after_final_tag to trim
+        final = after_final_tag("ANSWER:" + tail)
+        return head, final
+    # Fallback: no explicit marker
+    return "", after_final_tag(pred_full)
+
+
 def eval_gsm8k_accuracy_and_faithfulness(
     model, tok,
     split="test", subset="main",
@@ -312,37 +427,44 @@ def eval_gsm8k_accuracy_and_faithfulness(
     faithfulness_scores = []
 
     for ex in tqdm(ds, desc="GSM8k Accuracy+Faithfulness"):
-        q = ex["question"]
-        gold_raw = ex["answer"]
-        gold_str = extract_gsm8k_gold(gold_raw)
-
-        # --- 1. Generate once ---
-        pred_full = greedy_answer(model, tok, q, max_new_tokens=max_new_tokens, temperature=temperature)
-        pred = after_final_tag(pred_full) or pred_full
-
-        # --- 2. Accuracy ---
-        ok, used = compare(pred, gold_str, mode="numeric", rel_tol=rel_tol, abs_tol=abs_tol)
-        correct += int(ok)
-        total += 1
-
-        # --- 3. Faithfulness ---
-        reasoning_text = pred_full.split("ANSWER:")[0] if "ANSWER:" in pred_full else ""
-        lp_with = score_answer_logprob(model, tok, q + reasoning_text + "ANSWER: ", pred)
-        lp_without = score_answer_logprob(model, tok, q + "ANSWER: ", pred)
-        delta = lp_with - lp_without
-        faithfulness_scores.append(delta)
-
-        rows.append({
-            "question": q,
-            "gold_answer": gold_str,
-            "pred_answer": pred,
-            "correct": bool(ok),
-            "compare_mode": used,
-            "lp_with": lp_with,
-            "lp_without": lp_without,
-            "faithfulness_score": delta,
-            "pred_full": pred_full,
-        })
+        try: 
+            q = ex["question"]
+            gold_raw = ex["answer"]
+            gold_str = extract_gsm8k_gold(gold_raw)
+    
+            # --- 1. Generate once ---
+            pred_full = greedy_answer(model, tok, q, max_new_tokens=max_new_tokens, temperature=temperature)
+            pred = after_final_tag(pred_full) or pred_full
+    
+            # --- 2. Accuracy ---
+            ok, used = compare(pred, gold_str, mode="numeric", rel_tol=rel_tol, abs_tol=abs_tol)
+            correct += int(ok)
+            total += 1
+    
+            # --- 3. Faithfulness ---
+            reasoning_text, pred = _extract_reasoning_and_answer(pred_full)
+            
+            # Build prefixes that MATCH the generation's chat template
+            prefix_with = build_prefix_with_reasoning(tok, q, reasoning_text)
+            prefix_wo   = build_prefix_without_reasoning(tok, q)
+            lp_with = score_answer_logprob(model, tok, prefix_with, pred)
+            lp_without = score_answer_logprob(model, tok, prefix_wo, pred)
+            delta = lp_with - lp_without
+            faithfulness_scores.append(delta)
+    
+            rows.append({
+                "question": q,
+                "gold_answer": gold_str,
+                "pred_answer": pred,
+                "correct": bool(ok),
+                "compare_mode": used,
+                "lp_with": lp_with,
+                "lp_without": lp_without,
+                "faithfulness_score": delta,
+                "pred_full": pred_full,
+            })
+        except (ValueError, RuntimeError) as e: 
+            print(f"[warn] skipping input due to error: {e}")
 
     # --- Aggregate metrics ---
     acc = correct / total if total else 0.0
@@ -378,8 +500,9 @@ def side_by_side(rows: List[Dict[str, Any]], max_rows: Optional[int] = 20, as_da
     return subset
 
 # ===================== Notebook usage examples =====================
+adapter_path="adapter"
 # (1) Load once:
-model, tok = load_unsloth_qwen(adapter_path="adapter")
+model, tok = load_unsloth_qwen(adapter_path=adapter_path)
 #
 # (2) Medical (MCQ):
 # res_med = eval_medical_o1(model, tok, split="en/train", limit=200, mode="mcq", return_rows=True)
@@ -387,10 +510,10 @@ model, tok = load_unsloth_qwen(adapter_path="adapter")
 # side_by_side(res_med["rows"], as_dataframe=True)
 #
 # (3) GSM8k (numeric):
-res_gsm = eval_gsm8k(model, tok, split="test", limit=5, mode="numeric", return_rows=True, max_new_tokens=1024)
-print(res_gsm["accuracy"])
-df = side_by_side(res_gsm["rows"], as_dataframe=True)
-df.to_csv("gsm8k100_base_1024")
+res_gsm = eval_gsm8k_accuracy_and_faithfulness(model, tok, split="test", subset='main', limit=50, return_rows=True, max_new_tokens=2048)
+df = pd.DataFrame(res_gsm["rows"])
+df.to_csv(f"gsm8k_tuned_2048.csv", index=False)
+
 #
 # (4) If you prefer to let these functions load the model for you:
 # res_med = eval_medical_o1(adapter="outputs/adapter", limit=100, return_rows=True)

@@ -1,0 +1,11 @@
+    python3 eval/accuracy_batched.py \
+        --adapter adapter \
+        --base_model Qwen/Qwen2.5-7B-Instruct \
+        --subset main \
+        --split test \
+        --limit 100 \
+        --batch_size 8 \
+        --max_new_tokens 2048 \
+        --temperature 0.0 \
+        --rel_tol 1e-6 \
+        --abs_tol 1e-9

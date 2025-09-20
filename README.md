@@ -27,4 +27,7 @@ gsm8k100 (1).csv → 20% accuracy
 
 gsm8k100_base.csv → 41% accuracy
 
-> **⚠️ WRITE EVALS FIRST!!**
+- > **⚠️ WRITE EVALS FIRST!!**
+- > **⚠️ DO TRY-CATCH for any looping runs so one fail doesnt brick the system!!**
+- > **⚠️ Store as much RAW DATA as possible so you can do different analyses**
+
