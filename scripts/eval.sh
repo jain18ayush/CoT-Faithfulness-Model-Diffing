@@ -1,4 +1,4 @@
-    python3 eval/accuracy_batched.py \
+    python3 ../eval/accuracy_batched.py \
         --adapter adapter \
         --base_model Qwen/Qwen2.5-7B-Instruct \
         --subset main \

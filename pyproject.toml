@@ -16,4 +16,5 @@ dependencies = [
     "transformers>=4.56.1",
     "trl>=0.23.0",
     "dictionary-learning @ git+https://github.com/jkminder/dictionary_learning",
+    "pyyaml>=6.0.2",
 ]

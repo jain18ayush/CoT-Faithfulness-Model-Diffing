@@ -31,3 +31,8 @@ gsm8k100_base.csv → 41% accuracy
 - > **⚠️ DO TRY-CATCH for any looping runs so one fail doesnt brick the system!!**
 - > **⚠️ Store as much RAW DATA as possible so you can do different analyses**
 
+
+- We are taking from the residual stream 
+- Provide a docker container when publishing 
+
+- Run with small data then do big data 

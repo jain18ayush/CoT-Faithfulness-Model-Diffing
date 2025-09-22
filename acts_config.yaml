@@ -1,0 +1,14 @@
+model: Qwen/Qwen2.5-7B-Instruct
+adapter: adapter
+dataset:
+  name: opeani/gsm8k
+  subset: main
+  split: train
+  field: question
+chunk: 10000
+seq_len: 2048
+batch_size: 8
+drop_bos: true
+dtype: bf16  # can make this ["fp32", "fp16", "bf16"]
+out_dir: activations
+seed: 42
